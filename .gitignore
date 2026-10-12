@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.local/
+coverage/
+crm-backend/
+crm-complete/
+*.log

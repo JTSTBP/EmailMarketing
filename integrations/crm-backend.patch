@@ -1,0 +1,163 @@
+diff --git a/index.js b/index.js
+index 901380c..e49c00d 100644
+--- a/index.js
++++ b/index.js
+@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 5000;
+ 
+ // Middleware
+ app.use(cors());
+-app.use(express.json());
++app.use(express.json({ verify: (req, _res, buf) => { if (req.originalUrl.startsWith('/api/outreach/')) req.outreachRawBody = buf.toString(); } }));
+ 
+ // Database Connection
+ mongoose.connect(process.env.MONGO_URI)
+@@ -51,6 +51,7 @@ app.use('/api/poc-bucket', pocBucketRoutes);
+ app.use('/api/dashboard', dashboardRoutes);
+ app.use('/api/attendance', attendanceRoutes);
+ app.use('/api/email-leads', emailLeadRoutes);
++app.use('/api/outreach', require('./routes/outreachRoutes'));
+ app.use('/api/bd-daily-reports', bdDailyReportRoutes);
+ 
+ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+diff --git a/models/Lead.js b/models/Lead.js
+index 0393985..88f39f1 100644
+--- a/models/Lead.js
++++ b/models/Lead.js
+@@ -60,6 +60,7 @@ const LeadSchema = new mongoose.Schema(
+         rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: "users" },
+         rejectedAt: { type: Date },
+         hiring_needs: [{ type: String }],
++        outreach_hiring_sources: [{ type: String }], // Optional source URLs; legacy records have no verified dates.
+         points_of_contact: [PointOfContactSchema],
+         lead_source: { type: String },
+ 
+diff --git a/routes/emailLeadRoutes.js b/routes/emailLeadRoutes.js
+index 7ad776b..37c10e1 100644
+--- a/routes/emailLeadRoutes.js
++++ b/routes/emailLeadRoutes.js
+@@ -619,6 +619,7 @@ const EmailLeadSchema = new mongoose.Schema({
+   industry_name: { type: String },
+   company_info: { type: String },
+   hiring_needs: [{ type: String }],
++  outreach_hiring_sources: [{ type: String }],
+   no_of_designations: { type: Number, default: null },
+   no_of_positions: { type: Number, default: null },
+   linkedin_link: { type: String },
+diff --git a/routes/outreachRoutes.js b/routes/outreachRoutes.js
+new file mode 100644
+index 0000000..6fefdc3
+--- /dev/null
++++ b/routes/outreachRoutes.js
+@@ -0,0 +1,93 @@
++// Isolated outreach integration. Existing CRM email generation and sending remain unchanged.
++const express = require('express');
++const crypto = require('crypto');
++const mongoose = require('mongoose');
++const auth = require('../middleware/authMiddleware');
++const User = require('../models/User');
++const Lead = require('../models/Lead');
++const router = express.Router();
++const receiptSchema = new mongoose.Schema({ nonce: { type: String, unique: true }, createdAt: { type: Date, default: Date.now, expires: 600 } });
++const Receipt = mongoose.models.OutreachReceipt || mongoose.model('OutreachReceipt', receiptSchema);
++const stateSchema = new mongoose.Schema({ enrollmentId: { type: String, unique: true }, leadId: { type: String, index: true }, pocId: String, status: String, sent: Number, lastSentAt: String, nextAt: String, replyId: String, stopReason: String, revision: Number, eventId: String, updatedAt: Date });
++const Sequence = mongoose.models.OutreachSequence || mongoose.model('OutreachSequence', stateSchema);
++const fail = (status, message) => Object.assign(new Error(message), { status });
++const safeEqual = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
++const signature = (method, path, timestamp, nonce, body) => crypto.createHmac('sha256', process.env.OUTREACH_INTEGRATION_SECRET).update([method, path, timestamp, nonce, body].join('\n')).digest('hex');
++async function actor(id) {
++  if (!mongoose.isValidObjectId(id)) throw fail(401, 'Invalid user');
++  const u = await User.findById(id).select('name role status').lean();
++  if (!u || u.status !== 'Active' || !['Admin', 'Manager', 'BD Executive'].includes(u.role)) throw fail(403, 'User is inactive or unauthorized');
++  const scope = [String(u._id)];
++  if (u.role === 'Manager') scope.push(...(await User.find({ reporter: u._id }).select('_id').lean()).map(x => String(x._id)));
++  return { id: String(u._id), name: u.name, role: u.role, scope };
++}
++function scopeQuery(u) { return { status: { $nin: ['incomplete', 'rejected'] }, ...(u.role === 'Admin' ? {} : { $or: [{ assignedBy: { $in: u.scope } }, { createdBy: { $in: u.scope } }, { assignedTo: { $in: u.scope } }] }) }; }
++function mapContact(lead, p) {
++  return { id: `${lead._id}:${p._id}`, leadId: String(lead._id), pocId: String(p._id), company: lead.company_name || '', website: lead.website_url || '', industry: lead.industry_name || '', companyInfo: lead.company_info || '', name: p.name || '', designation: p.designation || '', email: p.email || '', linkedin: p.linkedin_url || '', owners: [lead.assignedBy, lead.createdBy, ...(lead.assignedTo || [])].filter(Boolean).map(x => String(x._id || x)), assignedExecutive: (lead.assignedTo || []).map(x => x.name || String(x)).join(', '), hiringNeeds: lead.hiring_needs || [], sourceLinks: (lead.outreach_hiring_sources || []).filter(x => /^https?:\/\//.test(x)) };
++}
++function models() { return [Lead, mongoose.models.EmailLead].filter(Boolean); }
++async function contact(u, leadId, pocId) {
++  if (!mongoose.isValidObjectId(leadId) || !mongoose.isValidObjectId(pocId)) throw fail(400, 'Invalid lead or contact ID');
++  for (const Model of models()) {
++    const lead = await Model.findOne({ ...scopeQuery(u), _id: leadId }).populate('assignedTo', 'name').lean();
++    const p = lead && (lead.points_of_contact || []).find(x => String(x._id) === pocId && !['pending', 'rejected'].includes(x.approvalStatus));
++    if (p) return mapContact(lead, p);
++  }
++  throw fail(403, 'Contact is outside your CRM scope');
++}
++router.get('/me', auth, async (req, res) => res.json(await actor(req.user.id)));
++// Browser Stop controls use the existing CRM JWT and fresh ownership checks.
++router.post('/leads/:leadId/stop', auth, async (req, res) => {
++  const u = await actor(req.user.id), pocId = req.body.pocId;
++  if (pocId) await contact(u, req.params.leadId, String(pocId));
++  else { let allowed = false; for (const Model of models()) if (await Model.exists({ ...scopeQuery(u), _id: req.params.leadId })) allowed = true; if (!allowed) throw fail(403, 'Company is outside your CRM scope'); }
++  if (!process.env.OUTREACH_API_URL || (process.env.OUTREACH_INTEGRATION_SECRET || '').length < 32) throw fail(503, 'Outreach integration is not configured');
++  const body = JSON.stringify({ actorId: u.id, leadId: req.params.leadId, ...(pocId ? { pocId: String(pocId) } : {}), reason: pocId ? 'crm_stop' : 'crm_company_stop' });
++  const timestamp = String(Date.now()), nonce = crypto.randomUUID(), endpoint = '/api/integration/stop';
++  try {
++    const response = await fetch(`${process.env.OUTREACH_API_URL}${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-outreach-timestamp': timestamp, 'x-outreach-nonce': nonce, 'x-outreach-signature': signature('POST', endpoint, timestamp, nonce, body) }, body, signal: AbortSignal.timeout(15000) });
++    if (!response.ok) throw fail(502, 'Email application rejected Stop. State has not been confirmed.');
++    res.json(await response.json());
++  } catch (error) { res.status(502).json({ status: 'Pending', message: 'Stop is unconfirmed. Refresh status and retry. An email already submitted cannot be recalled.' }); }
++});
++router.get('/leads/:leadId/status', auth, async (req, res) => {
++  const u = await actor(req.user.id); let allowed = false;
++  for (const Model of models()) if (await Model.exists({ ...scopeQuery(u), _id: req.params.leadId })) allowed = true;
++  if (!allowed) throw fail(403, 'Company is outside your CRM scope');
++  res.json({ sequences: await Sequence.find({ leadId: req.params.leadId }).select('-_id -__v').lean(), synchronization: 'Last acknowledged outreach events; refresh after a stop request.' });
++});
++// Service endpoints: short-lived HMAC request signatures and unique replay receipts.
++router.use(async (req, _res, next) => {
++  const secret = process.env.OUTREACH_INTEGRATION_SECRET || '';
++  if (secret.length < 32) throw fail(503, 'Outreach integration disabled');
++  const timestamp = req.get('x-outreach-timestamp') || '', nonce = req.get('x-outreach-nonce') || '', body = req.outreachRawBody || '';
++  if (Math.abs(Date.now() - Number(timestamp)) > 300000 || !Number.isFinite(Number(timestamp)) || nonce.length < 16 || nonce.length > 100) throw fail(401, 'Expired request');
++  if (!safeEqual(req.get('x-outreach-signature') || '', signature(req.method, req.originalUrl, timestamp, nonce, body))) throw fail(401, 'Invalid signature');
++  const actorId = req.get('x-outreach-actor') || '';
++  if (!safeEqual(req.get('x-outreach-actor-signature') || '', signature(req.method, req.originalUrl, timestamp, nonce, `${body}\n${actorId}`))) throw fail(401, 'Invalid actor signature');
++  try { await Receipt.create({ nonce }); } catch (error) { if (error.code === 11000) throw fail(409, 'Request was already processed'); throw error; }
++  req.outreachActor = actorId; next();
++});
++router.get('/actor', async (req, res) => res.json(await actor(req.outreachActor)));
++router.get('/contacts', async (req, res) => {
++  const u = await actor(req.outreachActor), page = Math.max(1, Math.min(100, Number(req.query.page) || 1));
++  const rows = [];
++  // Each page reads a bounded slice from both collections. POC IDs disambiguate contacts.
++  let hasMore = false;
++  for (const Model of models()) {
++    const leads = await Model.find(scopeQuery(u)).sort({ _id: 1 }).skip((page - 1) * 100).limit(101).populate('assignedTo', 'name').lean();
++    hasMore ||= leads.length > 100;
++    for (const lead of leads.slice(0, 100)) for (const p of lead.points_of_contact || []) if (p.email && !['pending', 'rejected'].includes(p.approvalStatus)) rows.push(mapContact(lead, p));
++  }
++  res.json({ contacts: rows, hasMore });
++});
++router.get('/contacts/:leadId/:pocId', async (req, res) => res.json(await contact(await actor(req.outreachActor), req.params.leadId, req.params.pocId)));
++router.post('/events', async (req, res) => {
++  const e = req.body;
++  if (!e || typeof e.id !== 'string' || typeof e.enrollmentId !== 'string' || !mongoose.isValidObjectId(e.leadId) || !mongoose.isValidObjectId(e.pocId) || !Number.isInteger(e.revision) || e.revision < 1 || !Number.isInteger(e.sent) || e.sent < 0 || e.sent > 5 || !['Draft', 'Ready', 'Active', 'Paused', 'Replied', 'Stopped', 'Completed', 'Failed'].includes(e.status)) throw fail(400, 'Invalid event');
++  const update = { enrollmentId: e.enrollmentId, leadId: e.leadId, pocId: e.pocId, status: e.status, sent: e.sent, lastSentAt: e.lastSentAt || null, nextAt: e.nextAt || null, replyId: e.replyId || null, stopReason: typeof e.stopReason === 'string' ? e.stopReason.slice(0, 500) : null, revision: e.revision, eventId: e.id, updatedAt: new Date() };
++  try { await Sequence.updateOne({ enrollmentId: e.enrollmentId, $or: [{ revision: { $lt: e.revision } }, { revision: { $exists: false } }] }, { $set: update }, { upsert: true }); } catch (error) { if (error.code !== 11000) throw error; }
++  res.json({ accepted: true });
++});
++router.use((error, _req, res, _next) => res.status(error.status || 500).json({ message: error.status ? error.message : 'Outreach integration failed' }));
++module.exports = router;
+diff --git a/scripts/migrateOutreach.js b/scripts/migrateOutreach.js
+new file mode 100644
+index 0000000..ccecdaa
+--- /dev/null
++++ b/scripts/migrateOutreach.js
+@@ -0,0 +1,13 @@
++// Run only with an explicitly configured staging/production MONGO_URI.
++// Does not load the repository's .env and never drops existing indexes.
++const mongoose = require('mongoose');
++require('../routes/outreachRoutes');
++async function main() {
++  if (!process.env.MONGO_URI) throw new Error('Set the intended MONGO_URI explicitly');
++  await mongoose.connect(process.env.MONGO_URI, { autoIndex: false });
++  await mongoose.model('OutreachReceipt').createIndexes();
++  await mongoose.model('OutreachSequence').createIndexes();
++  await mongoose.disconnect();
++  console.log('Outreach integration indexes created. Existing CRM data was not modified.');
++}
++main().catch(() => { console.error('Outreach index migration failed; inspect connection and index conflicts.'); process.exitCode = 1; });

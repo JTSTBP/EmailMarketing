@@ -1,0 +1,41 @@
+{
+  "name": "jobs-territory-outreach",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "api": "tsx watch src/server.ts",
+    "worker": "tsx src/worker-main.ts",
+    "build": "tsc --noEmit && vite build",
+    "start": "tsx src/server.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "migrate": "tsx scripts/migrate.ts"
+  },
+  "dependencies": {
+    "@fontsource-variable/dm-sans": "^5.3.0",
+    "@fontsource-variable/manrope": "^5.3.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "lucide-react": "^0.468.0",
+    "luxon": "^3.7.2",
+    "mongodb": "^6.20.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tsx": "^4.20.6",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "mongodb-memory-server": "^10.2.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12"
+  }
+}
